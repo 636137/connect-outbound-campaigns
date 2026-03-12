@@ -112,6 +112,16 @@ class AWSClients:
     @property
     def cloudformation(self):
         return self.get_client('cloudformation')
+    
+    @property
+    def kms(self):
+        """AWS KMS client."""
+        return self.get_client('kms')
+    
+    @property
+    def sts(self):
+        """AWS STS client."""
+        return self.get_client('sts')
 
 
 # =============================================================================
@@ -159,6 +169,338 @@ def get_instance_by_alias(clients: AWSClients, alias: str) -> Optional[Dict]:
         if instance['alias'] == alias:
             return instance
     return None
+
+
+def get_instance_details(clients: AWSClients, instance_id: str) -> Dict:
+    """
+    Get detailed instance information including service-linked role.
+    
+    Args:
+        clients: AWS clients wrapper
+        instance_id: Connect instance ID
+    
+    Returns:
+        Instance details including service role ARN
+    """
+    try:
+        response = clients.connect.describe_instance(InstanceId=instance_id)
+        instance = response.get('Instance', {})
+        return {
+            'id': instance.get('Id'),
+            'arn': instance.get('Arn'),
+            'alias': instance.get('InstanceAlias'),
+            'status': instance.get('InstanceStatus'),
+            'service_role': instance.get('ServiceRole'),
+            'created': str(instance.get('CreatedTime', '')),
+            'identity_type': instance.get('IdentityManagementType'),
+            'inbound_calls': instance.get('InboundCallsEnabled'),
+            'outbound_calls': instance.get('OutboundCallsEnabled')
+        }
+    except ClientError as e:
+        logger.error(f"Failed to get instance details: {e}")
+        raise
+
+
+# =============================================================================
+# PERMISSIONS MODULE - Auto-detect and fix permission issues
+# =============================================================================
+
+def find_customer_profiles_domain_for_instance(
+    clients: AWSClients,
+    instance_id: str,
+    region: str
+) -> Optional[Dict]:
+    """
+    Find the Customer Profiles domain linked to a Connect instance.
+    
+    A Connect instance can only be linked to ONE domain. We need to iterate
+    through all domains and check their integrations.
+    
+    Args:
+        clients: AWS clients wrapper
+        instance_id: Connect instance ID
+        region: AWS region
+    
+    Returns:
+        Domain details if found, None otherwise
+    """
+    account_id = clients.sts.get_caller_identity()['Account']
+    instance_arn = f'arn:aws:connect:{region}:{account_id}:instance/{instance_id}'
+    
+    try:
+        domains = clients.profiles.list_domains().get('Items', [])
+        
+        for domain in domains:
+            domain_name = domain.get('DomainName')
+            try:
+                integrations = clients.profiles.list_integrations(DomainName=domain_name)
+                for integ in integrations.get('Items', []):
+                    uri = integ.get('Uri', '')
+                    # Check if this integration is for our instance
+                    if instance_id in uri or instance_arn in uri:
+                        # Get full domain details
+                        domain_details = clients.profiles.get_domain(DomainName=domain_name)
+                        return {
+                            'name': domain_name,
+                            'kms_key': domain_details.get('DefaultEncryptionKey'),
+                            'dead_letter_queue': domain_details.get('DeadLetterQueueUrl'),
+                            'integration_uri': uri,
+                            'object_type': integ.get('ObjectTypeName')
+                        }
+            except ClientError:
+                continue
+        
+        return None
+    
+    except ClientError as e:
+        logger.error(f"Failed to find Customer Profiles domain: {e}")
+        return None
+
+
+def check_kms_grant_exists(
+    clients: AWSClients,
+    key_id: str,
+    grantee_principal: str
+) -> bool:
+    """
+    Check if a KMS grant already exists for the given principal.
+    
+    Args:
+        clients: AWS clients wrapper
+        key_id: KMS key ID or ARN
+        grantee_principal: The principal ARN to check
+    
+    Returns:
+        True if grant exists, False otherwise
+    """
+    try:
+        paginator = clients.kms.get_paginator('list_grants')
+        for page in paginator.paginate(KeyId=key_id):
+            for grant in page.get('Grants', []):
+                if grant.get('GranteePrincipal') == grantee_principal:
+                    # Check if it has the operations we need
+                    operations = grant.get('Operations', [])
+                    required_ops = {'Decrypt', 'GenerateDataKey', 'DescribeKey'}
+                    if required_ops.issubset(set(operations)):
+                        return True
+        return False
+    except ClientError as e:
+        logger.warning(f"Could not list KMS grants: {e}")
+        return False
+
+
+def create_kms_grant_for_connect(
+    clients: AWSClients,
+    key_id: str,
+    service_role_arn: str,
+    grant_name: str = 'ConnectCampaignAccess'
+) -> Optional[Dict]:
+    """
+    Create a KMS grant for the Connect service-linked role.
+    
+    This is required when Customer Profiles domain uses a customer-managed KMS key.
+    The service-linked role cannot be modified via IAM, so we use KMS grants instead.
+    
+    Args:
+        clients: AWS clients wrapper
+        key_id: KMS key ID or ARN
+        service_role_arn: Connect service-linked role ARN
+        grant_name: Name for the grant
+    
+    Returns:
+        Grant details if created, None if already exists or failed
+    """
+    # Check if grant already exists
+    if check_kms_grant_exists(clients, key_id, service_role_arn):
+        logger.info(f"KMS grant already exists for {service_role_arn}")
+        return {'status': 'exists', 'grantee': service_role_arn}
+    
+    try:
+        response = clients.kms.create_grant(
+            KeyId=key_id,
+            GranteePrincipal=service_role_arn,
+            Operations=[
+                'Decrypt',
+                'GenerateDataKey',
+                'GenerateDataKeyWithoutPlaintext',
+                'DescribeKey'
+            ],
+            Name=grant_name
+        )
+        
+        logger.info(f"Created KMS grant {response['GrantId']} for {service_role_arn}")
+        return {
+            'status': 'created',
+            'grant_id': response['GrantId'],
+            'grant_token': response['GrantToken'],
+            'grantee': service_role_arn
+        }
+    
+    except ClientError as e:
+        logger.error(f"Failed to create KMS grant: {e}")
+        return None
+
+
+def ensure_campaign_permissions(
+    clients: AWSClients,
+    instance_id: str,
+    region: str,
+    auto_fix: bool = True
+) -> Dict:
+    """
+    Check and optionally fix all permissions required for campaigns to work.
+    
+    This function addresses the "403 Forbidden" issue caused by the mismatch
+    between API caller credentials and the Connect service-linked role used
+    for campaign execution.
+    
+    Args:
+        clients: AWS clients wrapper
+        instance_id: Connect instance ID
+        region: AWS region
+        auto_fix: Whether to automatically fix permission issues
+    
+    Returns:
+        Permission check results with any fixes applied
+    """
+    results = {
+        'instance_id': instance_id,
+        'region': region,
+        'checks': [],
+        'fixes_applied': [],
+        'warnings': [],
+        'ready': True
+    }
+    
+    # 1. Get instance details and service-linked role
+    logger.info("Checking instance configuration...")
+    try:
+        instance = get_instance_details(clients, instance_id)
+        service_role = instance.get('service_role')
+        
+        if not service_role:
+            results['warnings'].append("Could not determine service-linked role")
+            results['ready'] = False
+            return results
+        
+        results['service_role'] = service_role
+        results['checks'].append({
+            'check': 'instance_service_role',
+            'status': 'OK',
+            'details': f"Service role: {service_role.split('/')[-1]}"
+        })
+    except Exception as e:
+        results['warnings'].append(f"Failed to get instance details: {e}")
+        results['ready'] = False
+        return results
+    
+    # 2. Find Customer Profiles domain linked to this instance
+    logger.info("Checking Customer Profiles domain...")
+    domain = find_customer_profiles_domain_for_instance(clients, instance_id, region)
+    
+    if not domain:
+        results['checks'].append({
+            'check': 'customer_profiles_domain',
+            'status': 'NOT_FOUND',
+            'details': 'No Customer Profiles domain linked to instance'
+        })
+        results['warnings'].append(
+            "No Customer Profiles domain found. "
+            "Campaigns without segments will still work."
+        )
+    else:
+        results['customer_profiles_domain'] = domain['name']
+        results['checks'].append({
+            'check': 'customer_profiles_domain',
+            'status': 'OK',
+            'details': f"Domain: {domain['name']}"
+        })
+        
+        # 3. Check KMS key permissions
+        kms_key = domain.get('kms_key')
+        
+        if not kms_key or 'alias/aws/' in str(kms_key):
+            # AWS-owned key - no grant needed
+            results['checks'].append({
+                'check': 'kms_permissions',
+                'status': 'OK',
+                'details': 'AWS-owned KMS key (no grant needed)'
+            })
+        else:
+            # Customer-managed key - need to check/create grant
+            logger.info(f"Customer-managed KMS key detected: {kms_key}")
+            
+            grant_exists = check_kms_grant_exists(clients, kms_key, service_role)
+            
+            if grant_exists:
+                results['checks'].append({
+                    'check': 'kms_permissions',
+                    'status': 'OK',
+                    'details': f"KMS grant exists for service role"
+                })
+            else:
+                results['checks'].append({
+                    'check': 'kms_permissions',
+                    'status': 'MISSING',
+                    'details': f"Service role needs KMS grant for key {kms_key}"
+                })
+                
+                if auto_fix:
+                    logger.info("Creating KMS grant for service-linked role...")
+                    grant_result = create_kms_grant_for_connect(
+                        clients, kms_key, service_role
+                    )
+                    
+                    if grant_result and grant_result.get('status') == 'created':
+                        results['fixes_applied'].append({
+                            'fix': 'kms_grant_created',
+                            'details': f"Created KMS grant {grant_result.get('grant_id')}"
+                        })
+                        results['checks'][-1]['status'] = 'FIXED'
+                    else:
+                        results['warnings'].append(
+                            "Could not create KMS grant. "
+                            "Campaigns may fail with 403 errors."
+                        )
+                        results['ready'] = False
+                else:
+                    results['warnings'].append(
+                        f"KMS grant needed. Run with --auto-fix or manually create grant."
+                    )
+                    results['ready'] = False
+    
+    # 4. Check outbound campaigns is enabled
+    logger.info("Checking outbound campaigns enabled...")
+    try:
+        campaigns = clients.campaigns.list_campaigns(
+            filters={'instanceIdFilter': {'operator': 'Eq', 'value': instance_id}}
+        )
+        results['checks'].append({
+            'check': 'outbound_campaigns_enabled',
+            'status': 'OK',
+            'details': f"Outbound campaigns enabled, {len(campaigns.get('campaignSummaryList', []))} campaigns exist"
+        })
+    except ClientError as e:
+        if 'ResourceNotFoundException' in str(e):
+            results['checks'].append({
+                'check': 'outbound_campaigns_enabled',
+                'status': 'NOT_ENABLED',
+                'details': 'Outbound campaigns not enabled for this instance'
+            })
+            results['warnings'].append(
+                "Enable outbound campaigns in Amazon Connect console first."
+            )
+            results['ready'] = False
+        else:
+            raise
+    
+    # Summary
+    if results['ready']:
+        logger.info("✅ All permission checks passed. Campaigns should work correctly.")
+    else:
+        logger.warning("⚠️  Some issues detected. See warnings for details.")
+    
+    return results
 
 
 def list_campaigns(clients: AWSClients, instance_id: str) -> List[Dict]:
@@ -1193,9 +1535,21 @@ def main():
     get_campaign_parser = subparsers.add_parser('get-campaign', help='Get campaign details')
     get_campaign_parser.add_argument('--campaign-id', required=True, help='Campaign ID')
     
+    # Check permissions command
+    check_perms_parser = subparsers.add_parser('check-permissions', 
+                                                help='Check and fix campaign permissions')
+    check_perms_parser.add_argument('--instance-id', help='Connect instance ID')
+    check_perms_parser.add_argument('--instance-alias', help='Connect instance alias')
+    check_perms_parser.add_argument('--auto-fix', action='store_true', default=True,
+                                    help='Automatically fix permission issues (default: True)')
+    check_perms_parser.add_argument('--no-fix', action='store_true',
+                                    help='Only check, do not fix issues')
+    
     # Create campaign command
     create_campaign_parser = subparsers.add_parser('create-campaign', help='Create outbound campaign')
     create_campaign_parser.add_argument('--config', required=True, help='Campaign config JSON file')
+    create_campaign_parser.add_argument('--skip-permission-check', action='store_true',
+                                        help='Skip automatic permission verification')
     
     # Start campaign command
     start_parser = subparsers.add_parser('start-campaign', help='Start a campaign')
@@ -1269,14 +1623,54 @@ def main():
         elif args.command == 'get-campaign':
             result = get_campaign(clients, args.campaign_id)
             
+        elif args.command == 'check-permissions':
+            # Get instance ID
+            if args.instance_alias:
+                instance = get_instance_by_alias(clients, args.instance_alias)
+                if not instance:
+                    logger.error(f"Instance not found: {args.instance_alias}")
+                    sys.exit(1)
+                instance_id = instance['id']
+            else:
+                instance_id = args.instance_id
+            
+            if not instance_id:
+                logger.error("Either --instance-id or --instance-alias is required")
+                sys.exit(1)
+            
+            auto_fix = not args.no_fix
+            result = ensure_campaign_permissions(
+                clients, instance_id, args.region, auto_fix=auto_fix
+            )
+            
         elif args.command == 'create-campaign':
             with open(args.config) as f:
                 config = json.load(f)
             
+            instance_id = config['connect_instance_id']
+            
+            # Run permission check before creating campaign (unless skipped)
+            if not args.skip_permission_check:
+                logger.info("Verifying campaign permissions...")
+                perm_check = ensure_campaign_permissions(
+                    clients, instance_id, args.region, auto_fix=True
+                )
+                
+                if not perm_check['ready']:
+                    logger.error("Permission issues detected. Fix them first or use --skip-permission-check")
+                    for warning in perm_check['warnings']:
+                        logger.error(f"  - {warning}")
+                    sys.exit(1)
+                
+                if perm_check['fixes_applied']:
+                    logger.info("Applied fixes:")
+                    for fix in perm_check['fixes_applied']:
+                        logger.info(f"  ✓ {fix['fix']}: {fix['details']}")
+            
             result = create_campaign(
                 clients,
                 name=config['name'],
-                connect_instance_id=config['connect_instance_id'],
+                connect_instance_id=instance_id,
                 channel_config=config['channel_config'],
                 source=config['source'],
                 schedule=config.get('schedule'),
