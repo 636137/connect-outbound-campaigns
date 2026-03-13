@@ -6,6 +6,18 @@ This code is proprietary to **Maximus**. **No public license is granted**. See [
 
 # Amazon Connect Outbound Campaigns
 
+## Repository Layout
+
+- `frontend/`
+- `backend/`
+- `infra/`
+
+## Local vs Deploy
+
+- Local: see `docs/how-to.md`
+- Deploy: see `docs/` and `infra/` (if present)
+
+
 A comprehensive AI-powered toolkit for building and managing intelligent outbound campaigns in Amazon Connect. Features include AI-powered customer segmentation, multi-channel campaigns (voice, SMS, email, WhatsApp), TCPA compliance automation, Amazon Bedrock personalization, and Contact Lens analytics.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
