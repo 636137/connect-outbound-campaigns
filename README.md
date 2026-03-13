@@ -1,3 +1,9 @@
+## Proprietary Notice
+
+This code is proprietary to **Maximus**. **No public license is granted**. See [`NOTICE`](./NOTICE).
+
+---
+
 # Amazon Connect Outbound Campaigns
 
 A comprehensive AI-powered toolkit for building and managing intelligent outbound campaigns in Amazon Connect. Features include AI-powered customer segmentation, multi-channel campaigns (voice, SMS, email, WhatsApp), TCPA compliance automation, Amazon Bedrock personalization, and Contact Lens analytics.
